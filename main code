@@ -1,0 +1,281 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <HX711.h>
+
+#define SCK 26
+#define DT 27
+#define pstao 5
+#define virtual1 22
+#define virtual2 25
+#define sensorp 14
+
+const char* ssid = "Wokwi-GUEST";
+const char* password = "";
+const char* mqttBroker = "broker.hivemq.com";
+const int mqttPort = 1883;
+const char* mqttClientId = "AlexandreE244466666";
+
+// Limites de peso para ativar a saída
+const float pesomin = 0.010;   // Em kg
+const float pesomax = 0.200;  // Em kg
+
+QueueHandle_t Queue1;
+QueueHandle_t queue2;
+QueueHandle_t queue3;
+
+HX711 scale;
+
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+
+int contador = 0;  // Contador
+
+void checkWiFiTask(void* parameter) {
+  while (1) {
+    bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+    xQueueSend(queue2, &wifiConnected, portMAX_DELAY);
+
+    bool mqttConnected = mqttClient.connected();
+    xQueueSend(queue3, &mqttConnected, portMAX_DELAY);
+
+    vTaskDelay(pdMS_TO_TICKS(3000)); // Verificar a cada 3 segundos
+  }
+}
+
+void reconnectWiFiTask(void* parameter) {
+  while (1) {
+    bool wifiConnected;
+    if (xQueueReceive(queue2, &wifiConnected, portMAX_DELAY) == pdPASS) {
+      if (!wifiConnected) {
+        // Reconectar ao WiFi
+        Serial.println("Tentando reconectar ao WiFi...");
+        WiFi.begin(ssid, password);
+        while (WiFi.status() != WL_CONNECTED) {
+          vTaskDelay(pdMS_TO_TICKS(500)); // Aguardar 500 ms antes de verificar novamente
+        }
+        Serial.println("Reconectado ao WiFi!");
+      }
+    }
+  }
+}
+
+void reconnectMqttTask(void* parameter) {
+  while (1) {
+    bool mqttConnected;
+    if (xQueueReceive(queue3, &mqttConnected, portMAX_DELAY) == pdPASS) {
+      if (!mqttConnected) {
+        // Reconectar ao broker MQTT
+        Serial.println("Tentando reconectar ao broker MQTT...");
+        while (!mqttClient.connected()) {
+          if (mqttClient.connect(mqttClientId)) {
+            Serial.println("Conectado ao broker MQTT!");
+            mqttClient.subscribe("basedoodio/244466666/vb11");
+          } else {
+            Serial.print("Falha na conexão MQTT, rc=");
+            Serial.print(mqttClient.state());
+            Serial.println(" Tentando novamente em 5 segundos...");
+            vTaskDelay(pdMS_TO_TICKS(5000)); // Aguardar 5 segundos antes de tentar reconectar novamente
+          }
+        }
+      }
+    }
+  }
+}
+
+void taskpesagem(void* parameter) {
+  while (1) {
+    
+    
+
+    if (digitalRead(sensorp)) {
+      float weight = scale.get_units();
+      float pesoemg = weight * 1000;
+      
+      Serial.print("Peso: ");
+      Serial.print(pesoemg);
+      Serial.println("g");
+
+      // Publica o valor do peso no tópico
+      String topic = "basedoodio/244466666/estado";
+      String payload = String(pesoemg);
+      mqttClient.publish(topic.c_str(), payload.c_str());
+
+      // Envia o valor do peso para a fila
+      xQueueSend(Queue1, (void*)&weight, portMAX_DELAY);
+    } 
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+void processWeightTask(void* parameter) {
+  float weight;
+
+  while (1) {
+    // Verifica se há algum valor na fila
+    if (xQueueReceive(Queue1, &weight, portMAX_DELAY) == pdTRUE) {
+      // Verifica se o peso está dentro do intervalo desejado
+      if (weight <= pesomax) {
+        Serial.println("embalagem vazia vindo ai");
+        mqttClient.publish("basedoodio/244466666/caixavazia", "Produto abaixo do peso mínimo");
+        mqttClient.publish("basedoodio/244466666/pistao", "pistao acionado via detecção");
+        digitalWrite(pstao, HIGH); // Ativa a saída
+
+        vTaskDelay(pdMS_TO_TICKS(2000)); // Aguarda 2 segundos
+
+        digitalWrite(pstao, LOW); // Desativa a saída
+        Serial.println("embalagem vazia retirada");
+        mqttClient.publish("basedoodio/244466666/caixavazia", "Produto retirado da linha de produção");
+        mqttClient.publish("basedoodio/244466666/pistao", " ");
+
+        contador++;  // Incrementa o contador
+
+        // Publica o valor do contador no tópico
+        String contadorTopic = "basedoodio/244466666/contador";
+        String contadorPayload = String(contador);
+        mqttClient.publish(contadorTopic.c_str(), contadorPayload.c_str());
+      }
+      if (weight >= pesomax) {
+        Serial.println("Tudo certo, segue a vida");
+        mqttClient.publish("basedoodio/244466666/caixavazia", "Produto ok");
+      }
+    }
+  }
+}
+
+void virtual1Task(void* parameter) {
+  while (1) {
+    if (digitalRead(virtual1) == HIGH) {
+      
+      xTaskCreate(
+        activatePstaoTask,
+        "ActivatePstaoTask",
+        10000,
+        NULL,
+        2,
+        NULL
+      );
+      vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+void activatePstaoTask(void* parameter) {
+  digitalWrite(pstao, HIGH); // Ativa a saída
+  vTaskDelay(pdMS_TO_TICKS(2000)); // Aguarda 2 segundos
+  digitalWrite(pstao, LOW); // Desativa a saída
+  mqttClient.publish("basedoodio/244466666/pistao", " ");
+  contador++;  // Incrementa o contador
+
+        // Publica o valor do contador no tópico
+        String contadorTopic = "basedoodio/244466666/contador";
+        String contadorPayload = String(contador);
+        mqttClient.publish(contadorTopic.c_str(), contadorPayload.c_str());
+  vTaskDelete(NULL);
+}
+
+void virtual2Callback(char* topic, byte* payload, unsigned int length) {
+  String payloadStr = "";
+  for (int i = 0; i < length; i++) {
+    payloadStr += (char)payload[i];
+  }
+  if (payloadStr == "on") {
+    Serial.println("subscribe recebida");
+    mqttClient.publish("basedoodio/244466666/pistao", "pistao acionado remotamente");
+    digitalWrite(virtual2, HIGH); // Ativa a saída
+    vTaskDelay((100)); // Aguarda 2 segundos
+    digitalWrite(virtual2, LOW); // Desativa a saída
+   
+  }
+}
+
+void setup() {
+  pinMode(SCK, INPUT);
+  pinMode(DT, INPUT);
+  pinMode(pstao, OUTPUT);
+  pinMode(virtual1, INPUT);
+  pinMode(virtual2, OUTPUT);
+  pinMode(sensorp, INPUT_PULLDOWN);
+
+  Serial.begin(115200);
+  scale.begin(DT, SCK);
+  scale.set_scale(418.3673469388);
+  scale.tare();
+
+  // Inicializar a conexão WiFi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
+  Serial.println("Conectado ao WiFi!");
+
+  // Inicializar o cliente MQTT
+  mqttClient.setServer(mqttBroker, mqttPort);
+  mqttClient.setCallback(virtual2Callback);
+
+  // Criar as queues
+  Queue1 = xQueueCreate(10, sizeof(float));
+  queue2 = xQueueCreate(1, sizeof(bool));
+  queue3 = xQueueCreate(1, sizeof(bool));
+
+  // Criar as tarefas
+  xTaskCreate(
+    checkWiFiTask,
+    "CheckWiFiTask",
+    10000,
+    NULL,
+    2,
+    NULL
+  );
+
+  xTaskCreate(
+    reconnectWiFiTask,
+    "ReconnectWiFiTask",
+    10000,
+    NULL,
+    2,
+    NULL
+  );
+
+  xTaskCreate(
+    reconnectMqttTask,
+    "ReconnectMqttTask",
+    10000,
+    NULL,
+    2,
+    NULL
+  );
+
+  xTaskCreatePinnedToCore(taskpesagem,
+    "taskpesagem",
+    4096,
+    NULL,
+    1,
+    NULL,
+    APP_CPU_NUM);
+
+  xTaskCreatePinnedToCore(processWeightTask,
+    "processWeightTask",
+    4096,
+    NULL,
+    1,
+    NULL,
+    APP_CPU_NUM);
+
+  xTaskCreatePinnedToCore(virtual1Task,
+    "Virtual1Task",
+    10000,
+    NULL,
+    2,
+    NULL,
+    APP_CPU_NUM);
+}
+
+void loop() {
+  mqttClient.loop();
+  // Não é necessário implementar nada no loop do FreeRTOS
+}
